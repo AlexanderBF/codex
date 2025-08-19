@@ -58,9 +58,8 @@ impl OllamaClient {
             .base_url
             .as_ref()
             .expect("oss provider must have a base_url");
-        let uses_openai_compat = is_openai_compatible_base_url(base_url)
-            || matches!(provider.wire_api, WireApi::Chat)
-                && is_openai_compatible_base_url(base_url);
+        let uses_openai_compat =
+            is_openai_compatible_base_url(base_url) || matches!(provider.wire_api, WireApi::Chat);
         let host_root = base_url_to_host_root(base_url);
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
@@ -98,12 +97,16 @@ impl OllamaClient {
         }
     }
 
-    /// Return the list of model names known to the local Ollama instance.
+    /// Return the list of model names known to the local server.
     pub async fn fetch_models(&self) -> io::Result<Vec<String>> {
-        let tags_url = format!("{}/api/tags", self.host_root.trim_end_matches('/'));
+        let url = if self.uses_openai_compat {
+            format!("{}/v1/models", self.host_root.trim_end_matches('/'))
+        } else {
+            format!("{}/api/tags", self.host_root.trim_end_matches('/'))
+        };
         let resp = self
             .client
-            .get(tags_url)
+            .get(url)
             .send()
             .await
             .map_err(io::Error::other)?;
@@ -111,16 +114,27 @@ impl OllamaClient {
             return Ok(Vec::new());
         }
         let val = resp.json::<JsonValue>().await.map_err(io::Error::other)?;
-        let names = val
-            .get("models")
-            .and_then(|m| m.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let names = if self.uses_openai_compat {
+            val.get("data")
+                .and_then(|d| d.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        } else {
+            val.get("models")
+                .and_then(|m| m.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
         Ok(names)
     }
 
@@ -166,9 +180,8 @@ impl OllamaClient {
                                         yield PullEvent::Error(err_msg.to_string());
                                         return;
                                     }
-                                    if let Some(status) = value.get("status").and_then(|s| s.as_str()) {
-                                        if status == "success" { yield PullEvent::Success; return; }
-                                    }
+                                    if let Some(status) = value.get("status").and_then(|s| s.as_str())
+                                        && status == "success" { yield PullEvent::Success; return; }
                                 }
                             }
                         }
@@ -266,6 +279,42 @@ mod tests {
         let client = OllamaClient::from_host_root(server.uri());
         let models = client.fetch_models().await.expect("fetch models");
         assert!(models.contains(&"llama3.2:3b".to_string()));
+        assert!(models.contains(&"mistral".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_models_openai_compat() {
+        if std::env::var(codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
+            tracing::info!(
+                "{} is set; skipping test_fetch_models_openai_compat",
+                codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
+            );
+            return;
+        }
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v1/models"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_raw(
+                    serde_json::json!({
+                        "data": [
+                            {"id": "llama3"},
+                            {"id": "mistral"}
+                        ]
+                    })
+                    .to_string(),
+                    "application/json",
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        let client = OllamaClient::try_from_provider_with_base_url(&format!("{}/v1", server.uri()))
+            .await
+            .expect("client");
+        let models = client.fetch_models().await.expect("fetch models");
+        assert!(models.contains(&"llama3".to_string()));
         assert!(models.contains(&"mistral".to_string()));
     }
 
